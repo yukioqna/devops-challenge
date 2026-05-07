@@ -249,13 +249,149 @@ writes.
 
 ---
 
+### Bug 8 — Redis down causes entire API to hang (Critical)
+
+**Root cause:** `await redis.set("last_call", Date.now())` sits in the main request handler
+after a successful DB query. When Redis loses connection, ioredis by default **queues**
+the command internally and waits for reconnection. The request handler never resolves,
+nginx hits its `proxy_read_timeout` (60 s default), and every single `/api/users` call
+returns `504 Gateway Time-out` for as long as Redis is down.
+
+Redis is used here as a non-critical audit log (`last_call`), not as a cache serving the
+response. A Redis outage should degrade gracefully, not take the API down entirely.
+
+**Confirmed via runtime test:** stopping the Redis container caused 100% of `/api/users`
+requests to return `504` within seconds.
+
+**Before:**
+```js
+await redis.set("last_call", Date.now());
+res.json({ ok: true, time: result.rows[0] });
+```
+
+**After:**
+```js
+// fire-and-forget — Redis failure never blocks the HTTP response
+redis.set("last_call", Date.now()).catch((err) => {
+  console.error("Redis set failed (non-fatal):", err.message);
+});
+res.json({ ok: true, time: result.rows[0] });
+```
+
+Also add `enableOfflineQueue: false` to the Redis client so commands are rejected
+immediately rather than queued when the connection is down:
+
+```js
+const redis = new Redis({
+  host: process.env.REDIS_HOST,
+  port: 6379,
+  retryStrategy: (times) => Math.min(times * 100, 3000),
+  enableOfflineQueue: false,
+});
+```
+
+---
+
+### Bug 9 — PostgreSQL pool emits unhandled `error` event, crashing Node.js (Critical)
+
+**Root cause:** `pg.Pool` emits an `error` event on idle connections when the database
+drops. Node.js terminates any process that emits `error` on an `EventEmitter` with no
+registered listener (identical mechanism to Bug 6 for Redis, but on the PG pool).
+
+**Confirmed via runtime test:** stopping the PostgreSQL container caused the API container
+to crash immediately, as shown in the logs:
+
+```
+Node.js v20.20.2
+API running on 3000      ← process restarted by docker
+```
+
+**Fix:**
+```js
+pool.on("error", (err) => {
+  console.error("Unexpected pool error:", err.message);
+});
+```
+
+---
+
+### Bug 10 — nginx caches upstream DNS at startup; stale IP after API restart causes 502 (Critical)
+
+**Root cause:** nginx resolves the hostname `api` once at startup and caches the IP for
+the lifetime of the process. When the API container crashes and restarts it receives a new
+IP from Docker's internal DHCP. nginx continues sending requests to the old IP, receives
+`ECONNREFUSED`, and returns `502 Bad Gateway` to all clients — even though the API is
+healthy again.
+
+**Confirmed via runtime test:** after the API restarted following a postgres-induced crash,
+nginx logs showed:
+
+```
+connect() failed (111: Connection refused) while connecting to upstream,
+upstream: "http://172.18.0.4:3000/api/users"
+```
+
+while `docker inspect` reported the API's actual IP had changed to `172.18.0.2`.
+
+**Fix:** use Docker's embedded DNS resolver (`127.0.0.11`) with a short TTL and a
+`set $upstream` variable. nginx only skips re-resolution when the upstream is a literal
+string; using a variable forces a DNS lookup on every request cycle:
+
+```nginx
+resolver 127.0.0.11 valid=10s ipv6=off;
+set $upstream_api http://api:3000;
+
+location /api/ {
+    proxy_pass $upstream_api;
+    proxy_connect_timeout 5s;
+    proxy_read_timeout    30s;
+    proxy_send_timeout    30s;
+}
+```
+
+---
+
+### Bug 11 — PostgreSQL connection never released on query error (Medium)
+
+**Root cause:** `db.release()` is called in the happy path only. If `db.query()` throws,
+execution jumps to the `catch` block and the connection is leaked back into the pool.
+With `max: 10`, ten consecutive query failures exhaust the pool permanently; subsequent
+requests block until `connectionTimeoutMillis` (2 s) elapses and fail with a timeout.
+
+**Before:**
+```js
+const db = await pool.connect();
+const result = await db.query("SELECT NOW()");
+db.release();                      // skipped if query throws
+```
+
+**After:**
+```js
+let db;
+try {
+  db = await pool.connect();
+  const result = await db.query("SELECT NOW()");
+  // ...
+} catch (err) {
+  // ...
+} finally {
+  if (db) db.release();            // always released
+}
+```
+
+---
+
 ## Change summary
 
 | File | Change | Severity |
 |---|---|---|
 | `nginx/conf.d/default.conf` | Proxy port `3001` → `3000` | Critical |
+| `nginx/conf.d/default.conf` | Docker DNS resolver + `set $upstream` variable for dynamic re-resolution (Bug 10) | Critical |
 | `docker-compose.yml` | Health checks on all services; `service_healthy` dependency conditions; `restart: unless-stopped`; named postgres volume; `max_connections=100` via command flag | Critical / High |
 | `api/src/index.js` | Redis error handler; retry strategy; PG `connectionTimeoutMillis` | Medium |
+| `api/src/index.js` | `pool.on("error")` handler to prevent Node.js crash (Bug 9) | Critical |
+| `api/src/index.js` | Redis write made fire-and-forget; `enableOfflineQueue: false` (Bug 8) | Critical |
+| `api/src/index.js` | `db.release()` moved to `finally` block (Bug 11) | Medium |
 | `api/Dockerfile` | `USER node` before `CMD` | Low |
 | `postgres/init.sql` | Removed `ALTER SYSTEM` | Medium |
 

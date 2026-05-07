@@ -15,10 +15,17 @@ const pool = new Pool({
   connectionTimeoutMillis: 2000,
 });
 
+// Bug 1 fix: handle idle connection errors to prevent Node.js crash
+pool.on("error", (err) => {
+  console.error("Unexpected pool error:", err.message);
+});
+
 const redis = new Redis({
   host: process.env.REDIS_HOST,
   port: 6379,
   retryStrategy: (times) => Math.min(times * 100, 3000),
+  lazyConnect: true,
+  enableOfflineQueue: false, // Bug 3 fix: don't queue commands when disconnected
 });
 
 redis.on("error", (err) => {
@@ -26,16 +33,23 @@ redis.on("error", (err) => {
 });
 
 app.get("/api/users", async (req, res) => {
+  let db;
   try {
-    const db = await pool.connect();
+    db = await pool.connect();
     const result = await db.query("SELECT NOW()");
-    db.release();
 
-    await redis.set("last_call", Date.now());
+    // Bug 3 fix: Redis is non-critical — fire-and-forget, never block the response
+    redis.set("last_call", Date.now()).catch((err) => {
+      console.error("Redis set failed (non-fatal):", err.message);
+    });
+
     res.json({ ok: true, time: result.rows[0] });
   } catch (err) {
     console.error(err);
     res.status(500).json({ ok: false, error: err.message });
+  } finally {
+    // Bug 4 fix: always release connection, even on error
+    if (db) db.release();
   }
 });
 
