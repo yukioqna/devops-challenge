@@ -1,0 +1,3 @@
+-- max_connections is set via postgres command flag in docker-compose (max_connections=100)
+-- Do not use ALTER SYSTEM here: it requires a server restart to take effect
+-- and the init script runs inside the first startup, making it a no-op.
